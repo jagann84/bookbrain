@@ -9,10 +9,14 @@ type Book = {
   review: string;
 };
 
+function getBaseUrl() {
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return "http://localhost:3000";
+}
+
 async function getBooks(): Promise<Book[]> {
-  const res = await fetch("http://localhost:3000/api/books", {
-    cache: "no-store",
-  });
+  const baseUrl = getBaseUrl();
+  const res = await fetch(`${baseUrl}/api/books`, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch books");
   const data = await res.json();
   return data.books as Book[];
@@ -22,10 +26,7 @@ export default async function Home() {
   const books = await getBooks();
 
   const total = books.length;
-
-  const unread = books.filter(
-    (b) => b.status?.toLowerCase() !== "read"
-  );
+  const unread = books.filter((b) => b.status?.toLowerCase() !== "read");
 
   const domainCounts: Record<string, number> = {};
   books.forEach((b) => {
@@ -63,7 +64,7 @@ export default async function Home() {
         {topRatedUnread.length === 0 && <div>No rated unread books yet.</div>}
         {topRatedUnread.map((b) => (
           <div key={b.id} style={{ marginTop: 8 }}>
-            <strong>{b.name}</strong> — {b.review}
+            <strong>{b.name}</strong> . {b.review}
           </div>
         ))}
       </div>
