@@ -17,10 +17,15 @@ export default function OutsidePage() {
     domainsUsed: string[];
     limit: number;
     minRating: number;
+    minRatingCount: number;
     count: number;
     picks: Pick[];
   }>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [minRating, setMinRating] = useState("4.0");
+  const [minRatingCount, setMinRatingCount] = useState("30");
+  const [limit, setLimit] = useState("6");
 
   async function load() {
     setLoading(true);
@@ -28,7 +33,10 @@ export default function OutsidePage() {
     setData(null);
 
     try {
-      const res = await fetch("/api/recommend-outside?limit=6&minRating=4.3");
+      const url = `/api/recommend-outside?limit=${encodeURIComponent(limit)}&minRating=${encodeURIComponent(
+        minRating
+      )}&minRatingCount=${encodeURIComponent(minRatingCount)}`;
+      const res = await fetch(url);
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error || "Failed to get recommendations");
       setData(json);
@@ -46,7 +54,20 @@ export default function OutsidePage() {
         High-rated nonfiction suggestions not already in your Notion list.
       </p>
 
-      <div style={{ marginTop: 16 }}>
+      <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <label>
+          Min rating{" "}
+          <input value={minRating} onChange={(e) => setMinRating(e.target.value)} style={{ width: 70 }} />
+        </label>
+        <label>
+          Min rating count{" "}
+          <input value={minRatingCount} onChange={(e) => setMinRatingCount(e.target.value)} style={{ width: 70 }} />
+        </label>
+        <label>
+          Limit{" "}
+          <input value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 50 }} />
+        </label>
+
         <button
           onClick={load}
           disabled={loading}
@@ -70,6 +91,7 @@ export default function OutsidePage() {
           <div style={{ color: "#333" }}>
             <div><strong>Domains used:</strong> {data.domainsUsed.join(", ")}</div>
             <div><strong>Min rating:</strong> {data.minRating}</div>
+            <div><strong>Min rating count:</strong> {data.minRatingCount}</div>
             <div><strong>Results:</strong> {data.count}</div>
           </div>
 

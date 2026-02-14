@@ -15,15 +15,21 @@ function norm(s: string): string {
 
 function getText(property: any): string {
   if (!property) return "";
-  if (property.type === "title")
-    return property.title?.map((t: any) => t.plain_text).join("") ?? "";
-  if (property.type === "rich_text")
-    return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
+  if (property.type === "title") return property.title?.map((t: any) => t.plain_text).join("") ?? "";
+  if (property.type === "rich_text") return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
   if (property.type === "select") return property.select?.name ?? "";
-  if (property.type === "number")
-    return property.number?.toString() ?? "";
+  if (property.type === "number") return property.number?.toString() ?? "";
   return "";
 }
+
+const BAD_DOMAIN_SEEDS = new Set([
+  "general",
+  "uncategorized",
+  "other",
+  "misc",
+  "n/a",
+  "na",
+]);
 
 async function fetchAllNotionBooks(databaseId: string) {
   const db: any = await notion.databases.retrieve({ database_id: databaseId });
@@ -46,19 +52,15 @@ async function fetchAllNotionBooks(databaseId: string) {
     cursor = response.next_cursor ?? undefined;
   }
 
-  // Deduplicate and build set of existing books to exclude
   const seen = new Set<string>();
   const existing = new Set<string>();
   const domainCounts: Record<string, number> = {};
 
   for (const page of allResults) {
     const props = page.properties;
-    const title = getText(
-      props["Book name"] ?? props["Book Name"] ?? props["Name"]
-    );
+    const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
     const author = getText(props["Author"]);
-    const domain =
-      getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
+    const domain = getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
 
     if (!norm(title)) continue;
 
@@ -76,8 +78,9 @@ async function fetchAllNotionBooks(databaseId: string) {
 function topDomains(domainCounts: Record<string, number>, n: number) {
   return Object.entries(domainCounts)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([d]) => d);
+    .map(([d]) => d)
+    .filter((d) => !BAD_DOMAIN_SEEDS.has(norm(d)))
+    .slice(0, n);
 }
 
 async function googleBooksSearch(subject: string, apiKey: string) {
@@ -93,41 +96,32 @@ export async function GET(req: Request) {
     const databaseId = process.env.NOTION_DATABASE_ID;
     const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
 
-    if (!process.env.NOTION_TOKEN) {
-      return NextResponse.json(
-        { error: "Missing NOTION_TOKEN" },
-        { status: 500 }
-      );
-    }
-    if (!databaseId) {
-      return NextResponse.json(
-        { error: "Missing NOTION_DATABASE_ID" },
-        { status: 500 }
-      );
-    }
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Missing GOOGLE_BOOKS_API_KEY" },
-        { status: 500 }
-      );
-    }
+    if (!process.env.NOTION_TOKEN) return NextResponse.json({ error: "Missing NOTION_TOKEN" }, { status: 500 });
+    if (!databaseId) return NextResponse.json({ error: "Missing NOTION_DATABASE_ID" }, { status: 500 });
+    if (!apiKey) return NextResponse.json({ error: "Missing GOOGLE_BOOKS_API_KEY" }, { status: 500 });
 
     const url = new URL(req.url);
-    const limit = Math.max(
-      3,
-      Math.min(Number(url.searchParams.get("limit") ?? "6"), 12)
-    );
-    const minRating = Math.max(
-      3.5,
-      Math.min(Number(url.searchParams.get("minRating") ?? "4.3"), 5)
-    );
+    const limit = Math.max(3, Math.min(Number(url.searchParams.get("limit") ?? "6"), 12));
+    const minRating = Math.max(3.5, Math.min(Number(url.searchParams.get("minRating") ?? "4.0"), 5));
+    const minRatingCount = Math.max(10, Math.min(Number(url.searchParams.get("minRatingCount") ?? "30"), 5000));
 
     const { existing, domainCounts } = await fetchAllNotionBooks(databaseId);
 
-    const domains = topDomains(domainCounts, 3);
+    const domains = topDomains(domainCounts, 4);
+
+    // Strong default seeds if your Notion domains are too generic
     const fallbackDomains = domains.length
       ? domains
-      : ["Psychology", "Business", "Leadership"];
+      : [
+          "Psychology",
+          "Behavioral Science",
+          "Leadership",
+          "Business",
+          "Cognitive Science",
+          "Neuroscience",
+          "Economics",
+          "Technology",
+        ];
 
     const candidates: any[] = [];
 
@@ -141,19 +135,16 @@ export async function GET(req: Request) {
         const authors: string[] = v.authors ?? [];
         const author = (authors[0] ?? "").toString();
 
-        const rating =
-          typeof v.averageRating === "number" ? v.averageRating : null;
-        const ratingCount =
-          typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
+        const rating = typeof v.averageRating === "number" ? v.averageRating : null;
+        const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
 
         if (!title) continue;
         if (rating === null || rating < minRating) continue;
-        if (ratingCount < 50) continue; // quality filter
+        if (ratingCount < minRatingCount) continue;
 
         const key = `${norm(title)}|${norm(author)}`;
         if (existing.has(key)) continue;
 
-        // Basic nonfiction guard
         const cats: string[] = v.categories ?? [];
         const catBlob = cats.join(" ").toLowerCase();
         if (catBlob.includes("fiction")) continue;
@@ -169,7 +160,6 @@ export async function GET(req: Request) {
       }
     }
 
-    // Deduplicate candidates
     const seen = new Set<string>();
     const unique = candidates.filter((c) => {
       const k = `${norm(c.title)}|${norm(c.author)}`;
@@ -178,10 +168,7 @@ export async function GET(req: Request) {
       return true;
     });
 
-    // Sort best-first
-    unique.sort(
-      (a, b) => (b.rating - a.rating) || (b.ratingCount - a.ratingCount)
-    );
+    unique.sort((a, b) => (b.rating - a.rating) || (b.ratingCount - a.ratingCount));
 
     const picks = unique.slice(0, limit);
 
@@ -189,13 +176,11 @@ export async function GET(req: Request) {
       domainsUsed: fallbackDomains,
       limit,
       minRating,
+      minRatingCount,
       count: picks.length,
       picks,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? "Unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
   }
 }
