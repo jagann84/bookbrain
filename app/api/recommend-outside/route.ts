@@ -20,7 +20,8 @@ function getText(property: any): string {
   if (property.type === "rich_text")
     return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
   if (property.type === "select") return property.select?.name ?? "";
-  if (property.type === "number") return property.number?.toString() ?? "";
+  if (property.type === "number")
+    return property.number?.toString() ?? "";
   return "";
 }
 
@@ -92,13 +93,22 @@ function isProbablyFiction(v: any): boolean {
   return cats.join(" ").toLowerCase().includes("fiction");
 }
 
+function score(rating: number | null, ratingCount: number) {
+  // Rated books win. Unrated books are allowed but score much lower.
+  const r = rating ?? 0;
+  const ratedBoost = rating === null ? -2.0 : 0; // push unrated down, but not out
+  const countBonus = Math.log10(Math.max(1, ratingCount)) * 0.2;
+  return r + countBonus + ratedBoost;
+}
+
 type Candidate = {
   title: string;
   author: string;
-  rating: number; // require rating for "highest rated"
+  rating: number | null;
   ratingCount: number;
   domainSeed: string;
   googleBooksId: string;
+  score: number;
 };
 
 export async function GET(req: Request) {
@@ -112,22 +122,13 @@ export async function GET(req: Request) {
 
     const url = new URL(req.url);
     const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? "6"), 12));
-
-    // “Highest rated” only makes sense if we require rating + some minimum count
-    const minRating = Math.max(3.5, Math.min(Number(url.searchParams.get("minRating") ?? "4.2"), 5));
-    const minRatingCount = Math.max(10, Math.min(Number(url.searchParams.get("minRatingCount") ?? "50"), 5000));
-
-    // Variety rule
     const maxPerDomain = Math.max(1, Math.min(Number(url.searchParams.get("maxPerDomain") ?? "2"), 6));
 
     const { existing, domainCounts } = await fetchExistingAndDomains(databaseId);
 
     const domains = topDomains(domainCounts, 5);
-    const seeds = domains.length
-      ? domains
-      : ["Psychology", "Leadership", "History", "Business", "Behavioral Science"];
+    const seeds = domains.length ? domains : ["Psychology", "Leadership", "History", "Business", "Technology"];
 
-    // Pull a large pool per seed (3 pages x 40 = 120)
     const startIndexes = [0, 40, 80];
 
     const candidates: Candidate[] = [];
@@ -156,11 +157,6 @@ export async function GET(req: Request) {
             const rating = typeof v.averageRating === "number" ? v.averageRating : null;
             const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
 
-            // Require rating to satisfy “highest rated”
-            if (rating === null) continue;
-            if (rating < minRating) continue;
-            if (ratingCount < minRatingCount) continue;
-
             const key = `${norm(title)}|${norm(author)}`;
             if (existing.has(key)) continue;
 
@@ -171,13 +167,14 @@ export async function GET(req: Request) {
               ratingCount,
               domainSeed: seed,
               googleBooksId: it.id,
+              score: score(rating, ratingCount),
             });
           }
         }
       }
     }
 
-    // Dedup title|author
+    // Dedup
     const seen = new Set<string>();
     const unique = candidates.filter((c) => {
       const k = `${norm(c.title)}|${norm(c.author)}`;
@@ -186,10 +183,10 @@ export async function GET(req: Request) {
       return true;
     });
 
-    // Sort highest rated first, then by ratingCount
-    unique.sort((a, b) => (b.rating - a.rating) || (b.ratingCount - a.ratingCount));
+    // Rank
+    unique.sort((a, b) => (b.score - a.score) || ((b.ratingCount ?? 0) - (a.ratingCount ?? 0)));
 
-    // Enforce variety: maxPerDomain per seed, fill until limit
+    // Variety: maxPerDomain
     const picked: Candidate[] = [];
     const perDomain: Record<string, number> = {};
 
@@ -199,20 +196,24 @@ export async function GET(req: Request) {
 
       picked.push(c);
       perDomain[c.domainSeed] = used + 1;
-
       if (picked.length >= limit) break;
     }
 
     return NextResponse.json({
       domainsUsed: seeds,
       limit,
-      minRating,
-      minRatingCount,
       maxPerDomain,
       count: picked.length,
-      picks: picked,
+      picks: picked.map((p) => ({
+        title: p.title,
+        author: p.author,
+        rating: p.rating,
+        ratingCount: p.ratingCount,
+        domainSeed: p.domainSeed,
+        googleBooksId: p.googleBooksId,
+      })),
       note:
-        "Google Books does not provide a true 'top rated' feed. This retrieves a large pool within your domains, excludes your Notion list, then ranks by rating and ratingCount and enforces variety.",
+        "Google Books often omits ratings. This returns top picks by ranking rated books first, then fills with unrated results, excluding your Notion list and enforcing variety.",
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
