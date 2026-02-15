@@ -5,6 +5,11 @@ export const runtime = "nodejs";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
+// Simple in-memory cache (best-effort)
+type CacheEntry = { ts: number; items: any[] };
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const seedCache = new Map<string, CacheEntry>();
+
 function norm(s: string): string {
   return (s || "")
     .toLowerCase()
@@ -75,11 +80,19 @@ function topDominantDomains(domainCounts: Record<string, number>, n: number) {
     .map(([d]) => d);
 }
 
-async function googleBooks(q: string, apiKey: string, startIndex: number) {
+async function googleBooksRaw(q: string, apiKey: string) {
   const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(
     q
-  )}&printType=books&maxResults=40&startIndex=${startIndex}&orderBy=relevance&key=${apiKey}`;
+  )}&printType=books&maxResults=40&startIndex=0&orderBy=relevance&key=${apiKey}`;
   const res = await fetch(url);
+
+  // Google Books uses 429 for rate limiting
+  if (res.status === 429) {
+    const err: any = new Error("RATE_LIMITED");
+    err.code = 429;
+    throw err;
+  }
+
   if (!res.ok) return null;
   return (await res.json()) as any;
 }
@@ -94,15 +107,11 @@ function blob(v: any): string {
 
 function isJunk(v: any): boolean {
   const b = blob(v);
-
-  // Fiction guard
   if (b.includes("fiction")) return true;
 
-  // Textbook / curriculum / academic / library-science / writing-market junk
   const junkTerms = [
     "grades k",
     "k-5",
-    "k–5",
     "curriculum",
     "lesson plan",
     "teacher",
@@ -122,7 +131,6 @@ function isJunk(v: any): boolean {
     "proposals",
     "handbook",
     "manual",
-    "guide to",
     "encyclopedia",
     "year book",
     "yearbook",
@@ -139,34 +147,36 @@ function weightedRating(rating: number, count: number) {
   return (count / (count + M)) * rating + (M / (count + M)) * PRIOR;
 }
 
-function score(
-  rating: number | null,
-  ratingCount: number,
-  domainSeed: string,
-  dominantDomains: string[]
-) {
+function score(rating: number | null, ratingCount: number, seed: string, dominantDomains: string[]) {
   const MIN_MEANINGFUL_COUNT = 50;
 
-  // Main quality signal
   let base = 0;
 
   if (rating !== null && ratingCount >= MIN_MEANINGFUL_COUNT) {
     base = weightedRating(rating, ratingCount);
   } else if (rating !== null) {
-    // Tiny-count ratings are mostly noise. Penalize hard.
     base = weightedRating(rating, Math.min(ratingCount, 10)) - 1.2;
   } else {
-    // Allow unrated only as filler, but keep it low.
     base = 1.8;
   }
 
-  // Breadth bias: penalize dominant domains, boost others
-  const breadth = dominantDomains.includes(domainSeed) ? -0.5 : 0.4;
-
-  // Small bonus for higher engagement
+  const breadth = dominantDomains.includes(seed) ? -0.5 : 0.4;
   const countBonus = Math.log10(Math.max(1, ratingCount)) * 0.1;
 
   return base + breadth + countBonus;
+}
+
+async function getSeedItems(seed: string, apiKey: string) {
+  const now = Date.now();
+  const cached = seedCache.get(seed);
+  if (cached && now - cached.ts < CACHE_TTL_MS) return cached.items;
+
+  const q = `"best ${seed} nonfiction books"`;
+  const data = await googleBooksRaw(q, apiKey);
+  const items: any[] = data?.items ?? [];
+
+  seedCache.set(seed, { ts: now, items });
+  return items;
 }
 
 export async function GET() {
@@ -186,49 +196,47 @@ export async function GET() {
 
     const seeds = ["Psychology", "Leadership", "History", "Business", "Economics", "Philosophy", "Technology", "AI"];
 
-    // Better queries than "seed nonfiction"
-    const queriesFor = (seed: string) => [
-      `"best ${seed} nonfiction books"`,
-      `"most recommended ${seed} books" nonfiction`,
-      `${seed} popular nonfiction books`,
-    ];
-
-    const startIndexes = [0, 40];
-
     const candidates: any[] = [];
 
     for (const seed of seeds) {
-      for (const q of queriesFor(seed)) {
-        for (const startIndex of startIndexes) {
-          const data = await googleBooks(q, apiKey, startIndex);
-          const items: any[] = data?.items ?? [];
-
-          for (const it of items) {
-            const v = it.volumeInfo || {};
-            const title = (v.title ?? "").toString();
-            const authors: string[] = v.authors ?? [];
-            const author = (authors[0] ?? "").toString();
-
-            if (!title) continue;
-            if (isJunk(v)) continue;
-
-            const rating = typeof v.averageRating === "number" ? v.averageRating : null;
-            const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
-
-            const key = `${norm(title)}|${norm(author)}`;
-            if (existing.has(key)) continue;
-
-            candidates.push({
-              title,
-              author,
-              rating,
-              ratingCount,
-              domainSeed: seed,
-              googleBooksId: it.id,
-              score: score(rating, ratingCount, seed, dominantDomains),
-            });
-          }
+      let items: any[] = [];
+      try {
+        items = await getSeedItems(seed, apiKey);
+      } catch (e: any) {
+        // If rate limited, try cached results
+        const cached = seedCache.get(seed);
+        if (cached) {
+          items = cached.items;
+        } else {
+          // No cache, skip this seed
+          continue;
         }
+      }
+
+      for (const it of items) {
+        const v = it.volumeInfo || {};
+        const title = (v.title ?? "").toString();
+        const authors: string[] = v.authors ?? [];
+        const author = (authors[0] ?? "").toString();
+        if (!title) continue;
+
+        if (isJunk(v)) continue;
+
+        const rating = typeof v.averageRating === "number" ? v.averageRating : null;
+        const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
+
+        const key = `${norm(title)}|${norm(author)}`;
+        if (existing.has(key)) continue;
+
+        candidates.push({
+          title,
+          author,
+          rating,
+          ratingCount,
+          domainSeed: seed,
+          googleBooksId: it.id,
+          score: score(rating, ratingCount, seed, dominantDomains),
+        });
       }
     }
 
@@ -243,17 +251,17 @@ export async function GET() {
 
     unique.sort((a, b) => b.score - a.score);
 
-    // Variety: max 2 per seed, max 1 from dominant domains
+    // Variety rules
     const picked: any[] = [];
-    const perDomain: Record<string, number> = {};
+    const perSeed: Record<string, number> = {};
 
     for (const c of unique) {
-      const used = perDomain[c.domainSeed] || 0;
+      const used = perSeed[c.domainSeed] || 0;
       if (dominantDomains.includes(c.domainSeed) && used >= 1) continue;
       if (used >= 2) continue;
 
       picked.push(c);
-      perDomain[c.domainSeed] = used + 1;
+      perSeed[c.domainSeed] = used + 1;
 
       if (picked.length >= limit) break;
     }
@@ -270,8 +278,16 @@ export async function GET() {
         domainSeed: p.domainSeed,
         googleBooksId: p.googleBooksId,
       })),
+      note: "Reduced Google Books calls and added caching to avoid rate limits.",
     });
   } catch (e: any) {
+    // If the entire request was rate limited and no cache existed
+    if (e?.code === 429 || e?.message === "RATE_LIMITED") {
+      return NextResponse.json(
+        { error: "You have been rate limited. Please try again in a few minutes." },
+        { status: 429 }
+      );
+    }
     return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
   }
 }
