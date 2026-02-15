@@ -12,18 +12,14 @@ type Pick = {
 };
 
 type OutsideResponse = {
-  // New API shape (breadth mode)
   mode?: string;
   dominantDomains?: string[];
-  minRatedCount?: number;
+  queryUsed?: string;
   count?: number;
   picks?: Pick[];
-
-  // Old API shape (keep compatibility so UI never crashes)
-  domainsUsed?: string[];
-  minRating?: number;
-  minRatingCount?: number;
-  limit?: number;
+  stale?: boolean;
+  note?: string;
+  error?: string;
 };
 
 export default function OutsidePage() {
@@ -37,7 +33,7 @@ export default function OutsidePage() {
     setData(null);
 
     try {
-      const res = await fetch("/api/recommend-outside");
+      const res = await fetch("/api/recommend-outside", { cache: "no-store" });
       const text = await res.text();
 
       let json: any;
@@ -58,12 +54,6 @@ export default function OutsidePage() {
   }
 
   const picks = data?.picks ?? [];
-  const domainsLine =
-    (data?.domainsUsed && data.domainsUsed.length > 0
-      ? data.domainsUsed
-      : data?.dominantDomains && data.dominantDomains.length > 0
-      ? data.dominantDomains
-      : [])?.join(", ") || "—";
 
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", maxWidth: 900 }}>
@@ -91,6 +81,23 @@ export default function OutsidePage() {
 
       {error && <p style={{ marginTop: 16, color: "crimson" }}>Error: {error}</p>}
 
+      {data?.stale && (
+        <div
+          style={{
+            marginTop: 16,
+            padding: 12,
+            borderRadius: 12,
+            border: "1px solid #f0d58c",
+            background: "#fff7db",
+            color: "#5a4100",
+          }}
+        >
+          <strong>Showing last saved results.</strong> Google Books rate-limited the app.
+          Try again later for fresh picks.
+          {data?.note ? <div style={{ marginTop: 6 }}>{data.note}</div> : null}
+        </div>
+      )}
+
       {data && (
         <div style={{ marginTop: 20 }}>
           <div style={{ color: "#333" }}>
@@ -100,13 +107,6 @@ export default function OutsidePage() {
             <div>
               <strong>Dominant domains:</strong>{" "}
               {(data.dominantDomains ?? []).join(", ") || "—"}
-            </div>
-            <div>
-              <strong>Domains shown:</strong> {domainsLine}
-            </div>
-            <div>
-              <strong>Min rated count:</strong>{" "}
-              {typeof data.minRatedCount === "number" ? data.minRatedCount : "—"}
             </div>
             <div>
               <strong>Results:</strong> {typeof data.count === "number" ? data.count : picks.length}
@@ -124,6 +124,25 @@ export default function OutsidePage() {
               </div>
             ))}
           </div>
+
+          {data.queryUsed ? (
+            <details style={{ marginTop: 18 }}>
+              <summary style={{ cursor: "pointer", color: "#555" }}>Show query used</summary>
+              <pre
+                style={{
+                  marginTop: 10,
+                  padding: 12,
+                  borderRadius: 12,
+                  border: "1px solid #eee",
+                  background: "#fafafa",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {data.queryUsed}
+              </pre>
+            </details>
+          ) : null}
         </div>
       )}
     </main>
