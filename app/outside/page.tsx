@@ -5,27 +5,31 @@ import { useState } from "react";
 type Pick = {
   title: string;
   author: string;
-  rating: number;
+  rating: number | null;
   ratingCount: number;
   domainSeed: string;
   googleBooksId: string;
 };
 
+type OutsideResponse = {
+  // New API shape (breadth mode)
+  mode?: string;
+  dominantDomains?: string[];
+  minRatedCount?: number;
+  count?: number;
+  picks?: Pick[];
+
+  // Old API shape (keep compatibility so UI never crashes)
+  domainsUsed?: string[];
+  minRating?: number;
+  minRatingCount?: number;
+  limit?: number;
+};
+
 export default function OutsidePage() {
   const [loading, setLoading] = useState(false);
-  const [data, setData] = useState<null | {
-    domainsUsed: string[];
-    limit: number;
-    minRating: number;
-    minRatingCount: number;
-    count: number;
-    picks: Pick[];
-  }>(null);
+  const [data, setData] = useState<OutsideResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const [minRating, setMinRating] = useState("4.0");
-  const [minRatingCount, setMinRatingCount] = useState("30");
-  const [limit, setLimit] = useState("6");
 
   async function load() {
     setLoading(true);
@@ -33,12 +37,18 @@ export default function OutsidePage() {
     setData(null);
 
     try {
-      const url = `/api/recommend-outside?limit=${encodeURIComponent(limit)}&minRating=${encodeURIComponent(
-        minRating
-      )}&minRatingCount=${encodeURIComponent(minRatingCount)}`;
-      const res = await fetch("/api/recommend-outside?limit=6&maxPerDomain=2");
-      const json = await res.json();
+      const res = await fetch("/api/recommend-outside");
+      const text = await res.text();
+
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new Error(`API did not return JSON. Got: ${text.slice(0, 120)}...`);
+      }
+
       if (!res.ok) throw new Error(json?.error || "Failed to get recommendations");
+
       setData(json);
     } catch (e: any) {
       setError(e.message || "Unknown error");
@@ -47,27 +57,22 @@ export default function OutsidePage() {
     }
   }
 
+  const picks = data?.picks ?? [];
+  const domainsLine =
+    (data?.domainsUsed && data.domainsUsed.length > 0
+      ? data.domainsUsed
+      : data?.dominantDomains && data.dominantDomains.length > 0
+      ? data.dominantDomains
+      : [])?.join(", ") || "—";
+
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", maxWidth: 900 }}>
       <h1 style={{ fontSize: 28, fontWeight: 700 }}>Outside Recommendations</h1>
       <p style={{ marginTop: 8, color: "#555" }}>
-        High-rated nonfiction suggestions not already in your Notion list.
+        High-quality nonfiction recommendations not already in your Notion list, optimized for intellectual breadth.
       </p>
 
-      <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-        <label>
-          Min rating{" "}
-          <input value={minRating} onChange={(e) => setMinRating(e.target.value)} style={{ width: 70 }} />
-        </label>
-        <label>
-          Min rating count{" "}
-          <input value={minRatingCount} onChange={(e) => setMinRatingCount(e.target.value)} style={{ width: 70 }} />
-        </label>
-        <label>
-          Limit{" "}
-          <input value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 50 }} />
-        </label>
-
+      <div style={{ marginTop: 16 }}>
         <button
           onClick={load}
           disabled={loading}
@@ -89,19 +94,32 @@ export default function OutsidePage() {
       {data && (
         <div style={{ marginTop: 20 }}>
           <div style={{ color: "#333" }}>
-            <div><strong>Domains used:</strong> {data.domainsUsed.join(", ")}</div>
-            <div><strong>Min rating:</strong> {data.minRating}</div>
-            <div><strong>Min rating count:</strong> {data.minRatingCount}</div>
-            <div><strong>Results:</strong> {data.count}</div>
+            <div>
+              <strong>Mode:</strong> {data.mode ?? "—"}
+            </div>
+            <div>
+              <strong>Dominant domains:</strong>{" "}
+              {(data.dominantDomains ?? []).join(", ") || "—"}
+            </div>
+            <div>
+              <strong>Domains shown:</strong> {domainsLine}
+            </div>
+            <div>
+              <strong>Min rated count:</strong>{" "}
+              {typeof data.minRatedCount === "number" ? data.minRatedCount : "—"}
+            </div>
+            <div>
+              <strong>Results:</strong> {typeof data.count === "number" ? data.count : picks.length}
+            </div>
           </div>
 
           <div style={{ marginTop: 16, display: "grid", gap: 10 }}>
-            {data.picks.map((p, idx) => (
+            {picks.map((p, idx) => (
               <div key={idx} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
                 <div style={{ fontWeight: 800 }}>{p.title}</div>
                 <div style={{ marginTop: 6, color: "#555" }}>{p.author}</div>
                 <div style={{ marginTop: 6, color: "#777" }}>
-                  Seed: {p.domainSeed} · Rating: {p.rating} ({p.ratingCount})
+                  Seed: {p.domainSeed} · Rating: {p.rating ?? "Unrated"} ({p.ratingCount ?? 0})
                 </div>
               </div>
             ))}
