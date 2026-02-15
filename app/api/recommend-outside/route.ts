@@ -20,7 +20,8 @@ function getText(property: any): string {
   if (property.type === "rich_text")
     return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
   if (property.type === "select") return property.select?.name ?? "";
-  if (property.type === "number") return property.number?.toString() ?? "";
+  if (property.type === "number")
+    return property.number?.toString() ?? "";
   return "";
 }
 
@@ -51,9 +52,12 @@ async function fetchExistingAndDomains(databaseId: string) {
 
   for (const page of allResults) {
     const props = page.properties;
-    const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
+    const title = getText(
+      props["Book name"] ?? props["Book Name"] ?? props["Name"]
+    );
     const author = getText(props["Author"]);
-    const domain = getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
+    const domain =
+      getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
 
     if (!norm(title)) continue;
 
@@ -89,27 +93,60 @@ function isProbablyFiction(v: any): boolean {
   return cats.join(" ").toLowerCase().includes("fiction");
 }
 
+function weightedRating(rating: number, count: number) {
+  const PRIOR = 4.2;
+  const M = 200;
+  return (count / (count + M)) * rating + (M / (count + M)) * PRIOR;
+}
+
 function breadthScore(
   rating: number | null,
   ratingCount: number,
   domainSeed: string,
-  dominantDomains: string[]
+  dominantDomains: string[],
+  minRatedCount: number
 ) {
-  const base = rating ?? 0;
-  const countBonus = Math.log10(Math.max(1, ratingCount)) * 0.2;
+  let base = 0;
 
-  // Penalize dominant domains
-  const dominancePenalty = dominantDomains.includes(domainSeed) ? -1.0 : 0.5;
+  if (rating !== null && ratingCount >= minRatedCount) {
+    base = weightedRating(rating, ratingCount);
+  } else if (rating !== null) {
+    base = weightedRating(rating, Math.min(ratingCount, 10)) - 1.0;
+  } else {
+    base = 2.0;
+  }
+
+  const countBonus = Math.log10(Math.max(1, ratingCount)) * 0.1;
+  const dominancePenalty = dominantDomains.includes(domainSeed) ? -0.6 : 0.4;
 
   return base + countBonus + dominancePenalty;
 }
 
-export async function GET(req: Request) {
+export async function GET() {
   try {
+    // ✅ Make env vars explicit strings (fixes Vercel TS build)
     const databaseId = process.env.NOTION_DATABASE_ID;
     const apiKey = process.env.GOOGLE_BOOKS_API_KEY;
+    const notionToken = process.env.NOTION_TOKEN;
+
+    if (!notionToken) {
+      return NextResponse.json({ error: "Missing NOTION_TOKEN" }, { status: 500 });
+    }
+    if (!databaseId) {
+      return NextResponse.json(
+        { error: "Missing NOTION_DATABASE_ID" },
+        { status: 500 }
+      );
+    }
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "Missing GOOGLE_BOOKS_API_KEY" },
+        { status: 500 }
+      );
+    }
 
     const limit = 6;
+    const minRatedCount = 50;
 
     const { existing, domainCounts } = await fetchExistingAndDomains(databaseId);
 
@@ -119,11 +156,10 @@ export async function GET(req: Request) {
       "Psychology",
       "Leadership",
       "History",
-      "Philosophy",
+      "Business",
       "Economics",
+      "Philosophy",
       "Technology",
-      "Cognitive Science",
-      "Neuroscience",
       "AI",
     ];
 
@@ -145,8 +181,10 @@ export async function GET(req: Request) {
           if (!title) continue;
           if (isProbablyFiction(v)) continue;
 
-          const rating = typeof v.averageRating === "number" ? v.averageRating : null;
-          const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
+          const rating =
+            typeof v.averageRating === "number" ? v.averageRating : null;
+          const ratingCount =
+            typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
 
           const key = `${norm(title)}|${norm(author)}`;
           if (existing.has(key)) continue;
@@ -158,7 +196,13 @@ export async function GET(req: Request) {
             ratingCount,
             domainSeed: seed,
             googleBooksId: it.id,
-            score: breadthScore(rating, ratingCount, seed, dominantDomains),
+            score: breadthScore(
+              rating,
+              ratingCount,
+              seed,
+              dominantDomains,
+              minRatedCount
+            ),
           });
         }
       }
@@ -174,7 +218,6 @@ export async function GET(req: Request) {
 
     unique.sort((a, b) => b.score - a.score);
 
-    // Enforce variety: max 1 from dominant domains
     const picked: any[] = [];
     const perDomain: Record<string, number> = {};
 
@@ -193,8 +236,16 @@ export async function GET(req: Request) {
     return NextResponse.json({
       mode: "Intellectual Breadth",
       dominantDomains,
+      minRatedCount,
       count: picked.length,
-      picks,
+      picks: picked.map((p) => ({
+        title: p.title,
+        author: p.author,
+        rating: p.rating,
+        ratingCount: p.ratingCount,
+        domainSeed: p.domainSeed,
+        googleBooksId: p.googleBooksId,
+      })),
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
