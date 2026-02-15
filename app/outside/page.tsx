@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type Pick = {
   title: string;
@@ -8,16 +8,14 @@ type Pick = {
   rating: number | null;
   ratingCount: number;
   domainSeed: string;
-  googleBooksId: string;
 };
 
 type OutsideResponse = {
   mode?: string;
   dominantDomains?: string[];
-  queryUsed?: string;
   count?: number;
   picks?: Pick[];
-  stale?: boolean;
+  fallbackSource?: "google" | "notion";
   note?: string;
   error?: string;
 };
@@ -30,18 +28,10 @@ export default function OutsidePage() {
   async function load() {
     setLoading(true);
     setError(null);
-    setData(null);
 
     try {
       const res = await fetch("/api/recommend-outside", { cache: "no-store" });
-      const text = await res.text();
-
-      let json: any;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new Error(`API did not return JSON. Got: ${text.slice(0, 120)}...`);
-      }
+      const json = (await res.json()) as OutsideResponse;
 
       if (!res.ok) throw new Error(json?.error || "Failed to get recommendations");
 
@@ -55,11 +45,13 @@ export default function OutsidePage() {
 
   const picks = data?.picks ?? [];
 
+  const showFallback = data?.fallbackSource === "notion";
+
   return (
     <main style={{ padding: 24, fontFamily: "system-ui", maxWidth: 900 }}>
       <h1 style={{ fontSize: 28, fontWeight: 700 }}>Outside Recommendations</h1>
       <p style={{ marginTop: 8, color: "#555" }}>
-        High-quality nonfiction recommendations not already in your Notion list, optimized for intellectual breadth.
+        High-quality nonfiction recommendations, optimized for intellectual breadth.
       </p>
 
       <div style={{ marginTop: 16 }}>
@@ -79,9 +71,7 @@ export default function OutsidePage() {
         </button>
       </div>
 
-      {error && <p style={{ marginTop: 16, color: "crimson" }}>Error: {error}</p>}
-
-      {data?.stale && (
+      {showFallback && (
         <div
           style={{
             marginTop: 16,
@@ -92,11 +82,11 @@ export default function OutsidePage() {
             color: "#5a4100",
           }}
         >
-          <strong>Showing last saved results.</strong> Google Books rate-limited the app.
-          Try again later for fresh picks.
-          {data?.note ? <div style={{ marginTop: 6 }}>{data.note}</div> : null}
+          <strong>Google Books rate limit hit.</strong> Showing recommendations from your Notion library instead.
         </div>
       )}
+
+      {error && <p style={{ marginTop: 16, color: "crimson" }}>Error: {error}</p>}
 
       {data && (
         <div style={{ marginTop: 20 }}>
@@ -119,30 +109,13 @@ export default function OutsidePage() {
                 <div style={{ fontWeight: 800 }}>{p.title}</div>
                 <div style={{ marginTop: 6, color: "#555" }}>{p.author}</div>
                 <div style={{ marginTop: 6, color: "#777" }}>
-                  Seed: {p.domainSeed} · Rating: {p.rating ?? "Unrated"} ({p.ratingCount ?? 0})
+                  Seed: {p.domainSeed} · Rating: {p.rating ?? "—"}
                 </div>
               </div>
             ))}
           </div>
 
-          {data.queryUsed ? (
-            <details style={{ marginTop: 18 }}>
-              <summary style={{ cursor: "pointer", color: "#555" }}>Show query used</summary>
-              <pre
-                style={{
-                  marginTop: 10,
-                  padding: 12,
-                  borderRadius: 12,
-                  border: "1px solid #eee",
-                  background: "#fafafa",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {data.queryUsed}
-              </pre>
-            </details>
-          ) : null}
+          {data.note ? <p style={{ marginTop: 14, color: "#666" }}>{data.note}</p> : null}
         </div>
       )}
     </main>
