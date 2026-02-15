@@ -36,7 +36,7 @@ export default function OutsidePage() {
       const url = `/api/recommend-outside?limit=${encodeURIComponent(limit)}&minRating=${encodeURIComponent(
         minRating
       )}&minRatingCount=${encodeURIComponent(minRatingCount)}`;
-      const res = await fetch(url);
+      const res = await fetch("/api/recommend-outside?limit=6&minRating=4.2&minRatingCount=50&maxPerDomain=2");
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error || "Failed to get recommendations");
       setData(json);

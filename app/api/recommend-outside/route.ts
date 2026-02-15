@@ -15,23 +15,18 @@ function norm(s: string): string {
 
 function getText(property: any): string {
   if (!property) return "";
-  if (property.type === "title") return property.title?.map((t: any) => t.plain_text).join("") ?? "";
-  if (property.type === "rich_text") return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
+  if (property.type === "title")
+    return property.title?.map((t: any) => t.plain_text).join("") ?? "";
+  if (property.type === "rich_text")
+    return property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
   if (property.type === "select") return property.select?.name ?? "";
   if (property.type === "number") return property.number?.toString() ?? "";
   return "";
 }
 
-const BAD_DOMAIN_SEEDS = new Set([
-  "general",
-  "uncategorized",
-  "other",
-  "misc",
-  "n/a",
-  "na",
-]);
+const BAD_DOMAIN_SEEDS = new Set(["general", "uncategorized", "other", "misc", "n/a", "na"]);
 
-async function fetchAllNotionBooks(databaseId: string) {
+async function fetchExistingAndDomains(databaseId: string) {
   const db: any = await notion.databases.retrieve({ database_id: databaseId });
   const dataSourceId = db?.data_sources?.[0]?.id;
   if (!dataSourceId) throw new Error("No data source found for this database");
@@ -52,8 +47,8 @@ async function fetchAllNotionBooks(databaseId: string) {
     cursor = response.next_cursor ?? undefined;
   }
 
-  const seen = new Set<string>();
   const existing = new Set<string>();
+  const seen = new Set<string>();
   const domainCounts: Record<string, number> = {};
 
   for (const page of allResults) {
@@ -83,13 +78,28 @@ function topDomains(domainCounts: Record<string, number>, n: number) {
     .slice(0, n);
 }
 
-async function googleBooksSearch(subject: string, apiKey: string) {
-  const q = encodeURIComponent(`subject:${subject} nonfiction`);
-  const url = `https://www.googleapis.com/books/v1/volumes?q=${q}&printType=books&maxResults=20&orderBy=relevance&key=${apiKey}`;
+async function googleBooks(q: string, apiKey: string, startIndex: number) {
+  const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(
+    q
+  )}&printType=books&maxResults=40&startIndex=${startIndex}&orderBy=relevance&key=${apiKey}`;
   const res = await fetch(url);
   if (!res.ok) return null;
   return (await res.json()) as any;
 }
+
+function isProbablyFiction(v: any): boolean {
+  const cats: string[] = v?.categories ?? [];
+  return cats.join(" ").toLowerCase().includes("fiction");
+}
+
+type Candidate = {
+  title: string;
+  author: string;
+  rating: number; // require rating for "highest rated"
+  ratingCount: number;
+  domainSeed: string;
+  googleBooksId: string;
+};
 
 export async function GET(req: Request) {
   try {
@@ -101,65 +111,73 @@ export async function GET(req: Request) {
     if (!apiKey) return NextResponse.json({ error: "Missing GOOGLE_BOOKS_API_KEY" }, { status: 500 });
 
     const url = new URL(req.url);
-    const limit = Math.max(3, Math.min(Number(url.searchParams.get("limit") ?? "6"), 12));
-    const minRating = Math.max(3.5, Math.min(Number(url.searchParams.get("minRating") ?? "4.0"), 5));
-    const minRatingCount = Math.max(10, Math.min(Number(url.searchParams.get("minRatingCount") ?? "30"), 5000));
+    const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit") ?? "6"), 12));
 
-    const { existing, domainCounts } = await fetchAllNotionBooks(databaseId);
+    // “Highest rated” only makes sense if we require rating + some minimum count
+    const minRating = Math.max(3.5, Math.min(Number(url.searchParams.get("minRating") ?? "4.2"), 5));
+    const minRatingCount = Math.max(10, Math.min(Number(url.searchParams.get("minRatingCount") ?? "50"), 5000));
 
-    const domains = topDomains(domainCounts, 4);
+    // Variety rule
+    const maxPerDomain = Math.max(1, Math.min(Number(url.searchParams.get("maxPerDomain") ?? "2"), 6));
 
-    // Strong default seeds if your Notion domains are too generic
-    const fallbackDomains = domains.length
+    const { existing, domainCounts } = await fetchExistingAndDomains(databaseId);
+
+    const domains = topDomains(domainCounts, 5);
+    const seeds = domains.length
       ? domains
-      : [
-          "Psychology",
-          "Behavioral Science",
-          "Leadership",
-          "Business",
-          "Cognitive Science",
-          "Neuroscience",
-          "Economics",
-          "Technology",
-        ];
+      : ["Psychology", "Leadership", "History", "Business", "Behavioral Science"];
 
-    const candidates: any[] = [];
+    // Pull a large pool per seed (3 pages x 40 = 120)
+    const startIndexes = [0, 40, 80];
 
-    for (const d of fallbackDomains) {
-      const data = await googleBooksSearch(d, apiKey);
-      const items: any[] = data?.items ?? [];
+    const candidates: Candidate[] = [];
 
-      for (const it of items) {
-        const v = it.volumeInfo || {};
-        const title = (v.title ?? "").toString();
-        const authors: string[] = v.authors ?? [];
-        const author = (authors[0] ?? "").toString();
+    for (const seed of seeds) {
+      const queries = [
+        `subject:${seed} nonfiction`,
+        `"${seed}" nonfiction best books`,
+        `${seed} non-fiction`,
+      ];
 
-        const rating = typeof v.averageRating === "number" ? v.averageRating : null;
-        const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
+      for (const q of queries) {
+        for (const startIndex of startIndexes) {
+          const data = await googleBooks(q, apiKey, startIndex);
+          const items: any[] = data?.items ?? [];
 
-        if (!title) continue;
-        if (rating === null || rating < minRating) continue;
-        if (ratingCount < minRatingCount) continue;
+          for (const it of items) {
+            const v = it.volumeInfo || {};
+            const title = (v.title ?? "").toString();
+            const authors: string[] = v.authors ?? [];
+            const author = (authors[0] ?? "").toString();
 
-        const key = `${norm(title)}|${norm(author)}`;
-        if (existing.has(key)) continue;
+            if (!title) continue;
+            if (isProbablyFiction(v)) continue;
 
-        const cats: string[] = v.categories ?? [];
-        const catBlob = cats.join(" ").toLowerCase();
-        if (catBlob.includes("fiction")) continue;
+            const rating = typeof v.averageRating === "number" ? v.averageRating : null;
+            const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
 
-        candidates.push({
-          title,
-          author,
-          rating,
-          ratingCount,
-          domainSeed: d,
-          googleBooksId: it.id,
-        });
+            // Require rating to satisfy “highest rated”
+            if (rating === null) continue;
+            if (rating < minRating) continue;
+            if (ratingCount < minRatingCount) continue;
+
+            const key = `${norm(title)}|${norm(author)}`;
+            if (existing.has(key)) continue;
+
+            candidates.push({
+              title,
+              author,
+              rating,
+              ratingCount,
+              domainSeed: seed,
+              googleBooksId: it.id,
+            });
+          }
+        }
       }
     }
 
+    // Dedup title|author
     const seen = new Set<string>();
     const unique = candidates.filter((c) => {
       const k = `${norm(c.title)}|${norm(c.author)}`;
@@ -168,17 +186,33 @@ export async function GET(req: Request) {
       return true;
     });
 
+    // Sort highest rated first, then by ratingCount
     unique.sort((a, b) => (b.rating - a.rating) || (b.ratingCount - a.ratingCount));
 
-    const picks = unique.slice(0, limit);
+    // Enforce variety: maxPerDomain per seed, fill until limit
+    const picked: Candidate[] = [];
+    const perDomain: Record<string, number> = {};
+
+    for (const c of unique) {
+      const used = perDomain[c.domainSeed] || 0;
+      if (used >= maxPerDomain) continue;
+
+      picked.push(c);
+      perDomain[c.domainSeed] = used + 1;
+
+      if (picked.length >= limit) break;
+    }
 
     return NextResponse.json({
-      domainsUsed: fallbackDomains,
+      domainsUsed: seeds,
       limit,
       minRating,
       minRatingCount,
-      count: picks.length,
-      picks,
+      maxPerDomain,
+      count: picked.length,
+      picks: picked,
+      note:
+        "Google Books does not provide a true 'top rated' feed. This retrieves a large pool within your domains, excludes your Notion list, then ranks by rating and ratingCount and enforces variety.",
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
