@@ -27,7 +27,6 @@ function getText(property: any): string {
 function getNumber(property: any): number | null {
   if (!property) return null;
   if (property.type === "number") return typeof property.number === "number" ? property.number : null;
-  // Sometimes rating is stored as rich_text
   if (property.type === "rich_text") {
     const raw = property.rich_text?.map((t: any) => t.plain_text).join("") ?? "";
     const n = Number(raw);
@@ -63,19 +62,20 @@ async function queryAllPages(dataSourceId: string) {
   return results;
 }
 
-async function fetchExistingAndDomainCounts(databaseId: string) {
+async function fetchNotionPagesAndCounts(databaseId: string) {
   const dataSourceId = await getDataSourceId(databaseId);
   const pages = await queryAllPages(dataSourceId);
 
-  const existing = new Set<string>();
   const seen = new Set<string>();
-  const domainCounts: Record<string, number> = {};
+  const domainCountsAll: Record<string, number> = {};
+  const domainCountsUnread: Record<string, number> = {};
 
   for (const page of pages) {
     const props = page.properties;
     const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
     const author = getText(props["Author"]);
     const domain = getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
+    const status = getText(props["Status"] ?? props["status"]) || "";
 
     if (!norm(title)) continue;
 
@@ -83,11 +83,14 @@ async function fetchExistingAndDomainCounts(databaseId: string) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    existing.add(key);
-    domainCounts[domain] = (domainCounts[domain] || 0) + 1;
+    domainCountsAll[domain] = (domainCountsAll[domain] || 0) + 1;
+
+    if (norm(status) === "unread") {
+      domainCountsUnread[domain] = (domainCountsUnread[domain] || 0) + 1;
+    }
   }
 
-  return { existing, domainCounts, pages };
+  return { pages, domainCountsAll, domainCountsUnread };
 }
 
 function topDominantDomains(domainCounts: Record<string, number>, n: number) {
@@ -196,12 +199,83 @@ function scoreGoogle(rating: number | null, ratingCount: number, seed: string, d
   return base + breadth + countBonus;
 }
 
-function scoreNotion(domain: string, domainCounts: Record<string, number>, rating: number | null) {
-  // Prefer underrepresented domains
-  const domainCount = domainCounts[domain] ?? 0;
-  const underRepBoost = 1 / Math.max(1, domainCount); // smaller count => larger boost
-  const ratingBoost = rating ?? 0; // if you have Goodreads rating already, great
-  return underRepBoost * 10 + ratingBoost; // boost breadth more than rating
+/**
+ * Notion fallback selection rules (breadth):
+ * - Prefer Unread books.
+ * - Enforce domain diversity: try to pick 6 distinct domains first.
+ * - Prefer underrepresented domains within Unread set.
+ * - Use rating as tie-breaker.
+ */
+function notionBreadthPicks(args: {
+  pages: any[];
+  limit: number;
+  domainCountsUnread: Record<string, number>;
+  domainCountsAll: Record<string, number>;
+}) {
+  const { pages, limit, domainCountsUnread, domainCountsAll } = args;
+
+  const extract = (page: any) => {
+    const props = page.properties;
+    const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
+    const author = getText(props["Author"]);
+    const domain = getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
+    const status = getText(props["Status"] ?? props["status"]) || "";
+    const rating =
+      getNumber(props["Goodreads Rating"] ?? props["Rating"] ?? props["Review"] ?? props["goodreads_rating"]) ?? null;
+
+    return { title, author, domain, status, rating };
+  };
+
+  const seen = new Set<string>();
+  const all = pages
+    .map(extract)
+    .filter((b) => {
+      if (!norm(b.title)) return false;
+      const key = `${norm(b.title)}|${norm(b.author)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  const unread = all.filter((b) => norm(b.status) === "unread");
+  const pool = unread.length >= limit ? unread : all;
+
+  const usingUnreadOnly = pool === unread;
+
+  // Score: underrepresented unread domains win. Rating is tie-breaker.
+  const domainCounts = usingUnreadOnly ? domainCountsUnread : domainCountsAll;
+
+  const score = (b: any) => {
+    const count = domainCounts[b.domain] ?? 0;
+    const underRep = 1 / Math.max(1, count); // smaller count => bigger score
+    const ratingBoost = b.rating ?? 0;
+    const unreadBoost = norm(b.status) === "unread" ? 1 : 0;
+    return underRep * 10 + ratingBoost + unreadBoost;
+  };
+
+  const ranked = [...pool].sort((a, b) => score(b) - score(a));
+
+  // Pass 1: pick distinct domains
+  const picked: any[] = [];
+  const usedDomains = new Set<string>();
+
+  for (const b of ranked) {
+    if (picked.length >= limit) break;
+    if (usedDomains.has(b.domain)) continue;
+    picked.push(b);
+    usedDomains.add(b.domain);
+  }
+
+  // Pass 2: fill remaining regardless of domain
+  if (picked.length < limit) {
+    for (const b of ranked) {
+      if (picked.length >= limit) break;
+      if (picked.some((p) => norm(p.title) === norm(b.title) && norm(p.author) === norm(b.author))) continue;
+      picked.push(b);
+    }
+  }
+
+  return { picks: picked.slice(0, limit), usingUnreadOnly };
 }
 
 export async function GET() {
@@ -215,10 +289,10 @@ export async function GET() {
 
     const limit = 6;
 
-    const { existing, domainCounts, pages } = await fetchExistingAndDomainCounts(databaseId);
-    const dominantDomains = topDominantDomains(domainCounts, 2);
+    const { pages, domainCountsAll, domainCountsUnread } = await fetchNotionPagesAndCounts(databaseId);
+    const dominantDomains = topDominantDomains(domainCountsAll, 2);
 
-    // Try Google if API key exists
+    // Try Google if key exists
     if (apiKey) {
       const query =
         'nonfiction (psychology OR leadership OR history OR business OR economics OR philosophy OR "artificial intelligence" OR technology OR neuroscience OR cognitive)';
@@ -228,6 +302,16 @@ export async function GET() {
         const items: any[] = data?.items ?? [];
 
         const candidates: any[] = [];
+
+        // Need the Notion existing keys to exclude duplicates
+        const existingKeys = new Set<string>();
+        for (const page of pages) {
+          const props = page.properties;
+          const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
+          const author = getText(props["Author"]);
+          if (!norm(title)) continue;
+          existingKeys.add(`${norm(title)}|${norm(author)}`);
+        }
 
         for (const it of items) {
           const v = it.volumeInfo || {};
@@ -242,7 +326,7 @@ export async function GET() {
           const ratingCount = typeof v.ratingsCount === "number" ? v.ratingsCount : 0;
 
           const key = `${norm(title)}|${norm(author)}`;
-          if (existing.has(key)) continue;
+          if (existingKeys.has(key)) continue;
 
           const seed = pickSeedFromGoogle(v);
 
@@ -252,7 +336,6 @@ export async function GET() {
             rating,
             ratingCount,
             domainSeed: seed,
-            googleBooksId: it.id,
             score: scoreGoogle(rating, ratingCount, seed, dominantDomains),
           });
         }
@@ -294,84 +377,32 @@ export async function GET() {
           })),
         });
       } catch (e: any) {
-        // fall through to Notion backup on rate limit
-        if (!(e?.code === 429 || e?.message === "RATE_LIMITED")) {
-          // Non-rate-limit error. Still fall back to Notion, but note it.
-        }
+        // If rate limited. fall back to Notion
       }
     }
 
-    // Notion fallback (rate limit or missing Google key)
-    const notionCandidates: any[] = [];
-
-    for (const page of pages) {
-      const props = page.properties;
-      const title = getText(props["Book name"] ?? props["Book Name"] ?? props["Name"]);
-      const author = getText(props["Author"]);
-      const domain = getText(props["Book domain"] ?? props["Domain"]) || "Uncategorized";
-
-      const status = getText(props["Status"] ?? props["status"]) || "";
-      const rating =
-        getNumber(props["Goodreads Rating"] ?? props["Rating"] ?? props["Review"] ?? props["goodreads_rating"]) ?? null;
-
-      if (!norm(title)) continue;
-      // Prefer unread, but don’t require it
-      const unreadBoost = norm(status) === "unread" ? 1 : 0;
-
-      notionCandidates.push({
-        title,
-        author,
-        rating,
-        ratingCount: 0,
-        domainSeed: domain,
-        score: scoreNotion(domain, domainCounts, rating) + unreadBoost,
-      });
-    }
-
-    // Dedup by title|author
-    const seenNotion = new Set<string>();
-    const uniqueNotion = notionCandidates.filter((c) => {
-      const k = `${norm(c.title)}|${norm(c.author)}`;
-      if (seenNotion.has(k)) return false;
-      seenNotion.add(k);
-      return true;
+    const { picks, usingUnreadOnly } = notionBreadthPicks({
+      pages,
+      limit,
+      domainCountsUnread,
+      domainCountsAll,
     });
-
-    uniqueNotion.sort((a, b) => b.score - a.score);
-
-    // Variety: try to pick unique domains first
-    const pickedNotion: any[] = [];
-    const usedDomains = new Set<string>();
-
-    for (const c of uniqueNotion) {
-      if (pickedNotion.length >= limit) break;
-      if (usedDomains.has(c.domainSeed)) continue;
-      pickedNotion.push(c);
-      usedDomains.add(c.domainSeed);
-    }
-
-    // If still not enough, fill remaining
-    if (pickedNotion.length < limit) {
-      for (const c of uniqueNotion) {
-        if (pickedNotion.length >= limit) break;
-        if (pickedNotion.some((p) => norm(p.title) === norm(c.title) && norm(p.author) === norm(c.author))) continue;
-        pickedNotion.push(c);
-      }
-    }
 
     return NextResponse.json({
       mode: "Intellectual Breadth",
       fallbackSource: "notion",
       dominantDomains,
-      count: pickedNotion.length,
-      picks: pickedNotion.map((p) => ({
+      count: picks.length,
+      picks: picks.map((p) => ({
         title: p.title,
         author: p.author,
         rating: p.rating,
         ratingCount: 0,
-        domainSeed: p.domainSeed,
+        domainSeed: p.domain,
       })),
-      note: "Google Books rate limit hit. Showing recommendations from your Notion library instead.",
+      note: usingUnreadOnly
+        ? "Google Books rate limit hit. Showing breadth picks from your Notion Unread list."
+        : "Google Books rate limit hit. Not enough Unread books. Showing breadth picks from your full Notion library.",
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
