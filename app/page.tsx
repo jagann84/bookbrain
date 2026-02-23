@@ -17,21 +17,30 @@ type Book = {
   // Supabase shape
   title?: string | null;
 
-  // Older Notion shape fallback
+  // Older fallback (if any)
   name?: string | null;
 
   author?: string | null;
   domain?: string | null;
   status?: "Unread" | "Reading" | "Read" | string;
   review?: number | null;
+  created_at?: string | null;
 };
 
 type Recommendation = {
   title: string;
   author: string;
   domain: string;
-  rating?: number;
+  rating?: number | null; // null/undefined => Not rated
   reason: string;
+};
+
+type Stats = {
+  total: number;
+  unread: number;
+  reading: number;
+  read: number;
+  avgRating: number;
 };
 
 function clean(s: any) {
@@ -92,7 +101,7 @@ async function safeJson(res: Response) {
   }
 }
 
-// ✅ Centralized helpers so you never lose titles again
+// Centralized helpers
 function getTitle(b: Book) {
   return clean(b.title || b.name || "");
 }
@@ -110,6 +119,9 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [books, setBooks] = useState<Book[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [statsError, setStatsError] = useState<string | null>(null);
 
   const [rec, setRec] = useState<Recommendation | null>(null);
   const [recLoading, setRecLoading] = useState(false);
@@ -150,20 +162,46 @@ export default function Page() {
   }, []);
 
   async function loadAll() {
-    await Promise.all([loadBooks(), loadRecommendation()]);
+    await Promise.all([loadStats(), loadBooks(), loadRecommendation()]);
+  }
+
+  async function loadStats() {
+    try {
+      setStatsError(null);
+  
+      const res = await fetch("/api/stats", {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-store" },
+      });
+  
+      const json = await safeJson(res);
+      if (!res.ok) throw new Error(json?.error || "Failed to fetch stats");
+  
+      setStats({
+        total: Number(json.total || 0),
+        unread: Number(json.unread || 0),
+        reading: Number(json.reading || 0),
+        read: Number(json.read || 0),
+        avgRating: Number(json.avgRating || 0),
+      });
+    } catch (e: any) {
+      setStats(null);
+      setStatsError(e?.message || "Failed to fetch stats");
+    }
   }
 
   async function loadBooks() {
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch("/api/books");
+
+      // If your /api/books supports page/limit, use it. If not, it still works.
+      const res = await fetch(`/api/books?page=${page}&limit=100`);
       const json = await safeJson(res);
       if (!res.ok) throw new Error(json?.error || "Failed to fetch books");
 
       const arr = Array.isArray(json?.books) ? json.books : [];
 
-      // ✅ Normalize to ensure title always exists when possible
       const normalized: Book[] = arr.map((b: any) => ({
         ...b,
         title: b?.title ?? b?.name ?? "",
@@ -213,12 +251,20 @@ export default function Page() {
     });
 
     const json = await safeJson(res);
+
     if (!res.ok) {
       alert(json?.error || "Failed to add book");
       return;
     }
 
-    if (json?.book) {
+    // Don't pretend add if server deduped it
+    if (json?.alreadyExists) {
+      alert("That book is already in your list.");
+      return;
+    }
+
+    // If server returned inserted row, update UI
+    if (json?.book?.id) {
       const bk: Book = {
         ...json.book,
         title: json.book?.title ?? json.book?.name ?? "",
@@ -229,11 +275,17 @@ export default function Page() {
         if (exists) return prev.map((b) => (b.id === bk.id ? bk : b));
         return [bk, ...prev];
       });
-      setPage(1);
+    } else {
+      // Fallback: reconcile from server
+      await loadBooks();
     }
+
+    // IMPORTANT: KPIs are global. Refresh them from /api/stats.
+    await loadStats();
 
     setTitleInput("");
     setAuthorInput("");
+    setPage(1);
   }
 
   async function addRecommended(status: "Unread" | "Read") {
@@ -255,7 +307,12 @@ export default function Page() {
       return;
     }
 
-    if (json?.book) {
+    if (json?.alreadyExists) {
+      alert("That recommended book is already in your list.");
+      return;
+    }
+
+    if (json?.book?.id) {
       const bk: Book = {
         ...json.book,
         title: json.book?.title ?? json.book?.name ?? "",
@@ -266,8 +323,12 @@ export default function Page() {
         if (exists) return prev.map((b) => (b.id === bk.id ? bk : b));
         return [bk, ...prev];
       });
-      setPage(1);
+    } else {
+      await loadBooks();
     }
+
+    await loadStats();
+    setPage(1);
   }
 
   async function updateStatus(bookId: string, status: "Unread" | "Reading" | "Read") {
@@ -284,6 +345,7 @@ export default function Page() {
     }
 
     setBooks((prev) => prev.map((b) => (b.id === bookId ? { ...b, status } : b)));
+    await loadStats();
   }
 
   async function deleteBook(bookId: string, title: string) {
@@ -304,28 +366,21 @@ export default function Page() {
 
     setBooks((prev) => prev.filter((b) => b.id !== bookId));
     setRowMenuOpenFor(null);
+    await loadStats();
   }
 
-  const derived = useMemo(() => {
-    const total = books.length;
-    const unread = books.filter((b) => statusLabel(b.status) === "Unread").length;
-    const reading = books.filter((b) => statusLabel(b.status) === "Reading").length;
-    const read = books.filter((b) => statusLabel(b.status) === "Read").length;
-
-    const avgRating = books.reduce((sum, b) => sum + getRating(b), 0) / (books.length || 1);
-
+  // Chart data (NOTE: this reflects currently loaded books in memory).
+  // If you want chart to be global too, we’ll add domain counts to /api/stats next.
+  const domainData = useMemo(() => {
     const domainCounts: Record<string, number> = {};
     for (const b of books) {
       const d = getDomain(b);
       domainCounts[d] = (domainCounts[d] || 0) + 1;
     }
-
-    const domainData = Object.entries(domainCounts)
+    return Object.entries(domainCounts)
       .map(([domain, count]) => ({ domain, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 10);
-
-    return { total, unread, reading, read, avgRating, domainData };
   }, [books]);
 
   const filteredSorted = useMemo(() => {
@@ -423,14 +478,19 @@ export default function Page() {
 
       {loading && <div className="text-sm text-zinc-600">Loading…</div>}
       {error && <div className="text-sm text-red-600">Error: {error}</div>}
+      {statsError && <div className="text-sm text-red-600">Stats error: {statsError}</div>}
 
+      {/* KPI cards must reflect global stats */}
       {!loading && !error && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
-          <Kpi label="Total" value={derived.total} />
-          <Kpi label="Unread" value={derived.unread} />
-          <Kpi label="Reading" value={derived.reading} />
-          <Kpi label="Read" value={derived.read} />
-          <Kpi label="Avg rating" value={derived.avgRating.toFixed(2)} />
+          <Kpi label="Total" value={stats ? stats.total : "—"} />
+          <Kpi label="Unread" value={stats ? stats.unread : "—"} />
+          <Kpi label="Reading" value={stats ? stats.reading : "—"} />
+          <Kpi label="Read" value={stats ? stats.read : "—"} />
+          <Kpi
+            label="Avg rating"
+            value={stats ? stats.avgRating.toFixed(2) : "—"}
+          />
         </div>
       )}
 
@@ -442,22 +502,37 @@ export default function Page() {
               Recommended next
             </div>
 
-            {recLoading && <div className="mt-2 text-sm text-zinc-600">Loading recommendation…</div>}
-            {!recLoading && recError && <div className="mt-2 text-sm text-red-600">Error: {recError}</div>}
+            {recLoading && (
+              <div className="mt-2 text-sm text-zinc-600">Loading recommendation…</div>
+            )}
+
+            {!recLoading && recError && (
+              <div className="mt-2 text-sm text-red-600">Error: {recError}</div>
+            )}
 
             {!recLoading && !recError && rec && (
               <>
-                <h2 className="mt-2 text-xl font-semibold leading-tight">{rec.title}</h2>
+                <h2 className="mt-2 text-xl font-semibold leading-tight">
+                  {rec.title}
+                </h2>
+
                 <div className="mt-1 text-sm text-zinc-600">
-                  {rec.author} · {rec.domain}
-                  {typeof rec.rating === "number" && rec.rating > 0 ? ` · Rating ${rec.rating.toFixed(2)}` : ""}
+                  {rec.author} · {rec.domain} ·{" "}
+                  {typeof rec.rating === "number" && rec.rating > 0
+                    ? `Rating ${rec.rating.toFixed(2)}`
+                    : "Not rated"}
                 </div>
-                <p className="mt-3 text-sm leading-6 text-zinc-700">{rec.reason}</p>
+
+                <p className="mt-3 text-sm leading-6 text-zinc-700">
+                  {rec.reason}
+                </p>
               </>
             )}
 
             {!recLoading && !recError && !rec && (
-              <div className="mt-2 text-sm text-zinc-600">No recommendation available right now.</div>
+              <div className="mt-2 text-sm text-zinc-600">
+                No recommendation available right now.
+              </div>
             )}
           </div>
 
@@ -527,18 +602,28 @@ export default function Page() {
             <div className="mt-4 h-[320px]">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
-                  data={derived.domainData}
+                  data={domainData}
                   layout="vertical"
                   margin={{ top: 8, right: 12, bottom: 8, left: 12 }}
                   barCategoryGap={10}
                 >
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis type="number" tick={{ fontSize: 11 }} />
-                  <YAxis type="category" dataKey="domain" width={120} tick={{ fontSize: 12 }} interval={0} />
+                  <YAxis
+                    type="category"
+                    dataKey="domain"
+                    width={120}
+                    tick={{ fontSize: 12 }}
+                    interval={0}
+                  />
                   <Tooltip />
                   <Bar dataKey="count" fill="#111827" radius={[10, 10, 10, 10]} />
                 </BarChart>
               </ResponsiveContainer>
+            </div>
+
+            <div className="mt-3 text-xs text-zinc-500">
+              Note. This chart currently reflects the books loaded in the table. We can make it global next.
             </div>
           </div>
 
@@ -604,7 +689,9 @@ export default function Page() {
 
                         <td className="px-4 py-3">{getDomain(b)}</td>
 
-                        <td className="px-4 py-3 tabular-nums">{getRating(b).toFixed(2)}</td>
+                        <td className="px-4 py-3 tabular-nums">
+                          {getRating(b).toFixed(2)}
+                        </td>
 
                         <td className="px-4 py-3">
                           <StatusPill status={s} />
@@ -612,7 +699,10 @@ export default function Page() {
 
                         <td className="px-4 py-3">
                           <div className="flex justify-end">
-                            <div className="relative" ref={rowMenuOpenFor === b.id ? rowMenuRef : null}>
+                            <div
+                              className="relative"
+                              ref={rowMenuOpenFor === b.id ? rowMenuRef : null}
+                            >
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -732,15 +822,28 @@ function Kpi(props: { label: string; value: any }) {
 
 function StatusPill(props: { status: string }) {
   const s = props.status;
-  const base = "inline-flex items-center rounded-full px-3 py-1 text-xs font-medium border";
+  const base =
+    "inline-flex items-center rounded-full px-3 py-1 text-xs font-medium border";
 
   if (s === "Read") {
-    return <span className={`${base} border-emerald-200 bg-emerald-50 text-emerald-700`}>Read</span>;
+    return (
+      <span className={`${base} border-emerald-200 bg-emerald-50 text-emerald-700`}>
+        Read
+      </span>
+    );
   }
   if (s === "Reading") {
-    return <span className={`${base} border-amber-200 bg-amber-50 text-amber-800`}>Reading</span>;
+    return (
+      <span className={`${base} border-amber-200 bg-amber-50 text-amber-800`}>
+        Reading
+      </span>
+    );
   }
-  return <span className={`${base} border-zinc-200 bg-zinc-50 text-zinc-700`}>Unread</span>;
+  return (
+    <span className={`${base} border-zinc-200 bg-zinc-50 text-zinc-700`}>
+      Unread
+    </span>
+  );
 }
 
 function MenuButton(props: {
@@ -754,7 +857,11 @@ function MenuButton(props: {
   const dangerCls = props.danger ? " text-red-600 hover:bg-red-50" : " text-zinc-900";
 
   return (
-    <button onClick={props.onClick} disabled={props.disabled} className={cls + dangerCls}>
+    <button
+      onClick={props.onClick}
+      disabled={props.disabled}
+      className={cls + dangerCls}
+    >
       {props.children}
     </button>
   );

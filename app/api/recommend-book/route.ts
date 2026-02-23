@@ -1,19 +1,42 @@
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-function clean(s: string) {
-  return (s || "").toString().replace(/\s+/g, " ").trim();
-}
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-function norm(s: string) {
+function clean(s: any) {
+  return String(s ?? "").replace(/\s+/g, " ").trim();
+}
+function norm(s: any) {
   return clean(s).toLowerCase();
 }
 
-function keyTitleAuthor(title: string, author: string) {
-  return `${norm(title)}::${norm(author || "")}`;
-}
+type Rec = {
+  title: string;
+  author: string;
+  domain: string;
+  rating?: number | null;
+  reason: string;
+};
 
-async function fetchGoogleBooksRating(title: string, author: string): Promise<number | null> {
+const ALLOWED_DOMAINS = [
+  "Psychology",
+  "Business Strategy",
+  "Leadership",
+  "AI",
+  "History",
+  "Creativity",
+  "Personal Finance",
+  "Health & Longevity",
+  "Spirituality",
+  "Political Philosophy",
+  "Design",
+  "Product",
+  "Mental Models",
+  "General",
+] as const;
+
+async function fetchGoogleBooksRating(title: string, author: string) {
   const key = process.env.GOOGLE_BOOKS_API_KEY;
   if (!key) return null;
 
@@ -22,10 +45,10 @@ async function fetchGoogleBooksRating(title: string, author: string): Promise<nu
   const q = qAuthor ? `${qTitle}+${qAuthor}` : qTitle;
 
   const url = `https://www.googleapis.com/books/v1/volumes?q=${q}&maxResults=5&printType=books&key=${key}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) return null;
 
-  const json: any = await res.json();
+  const json: any = await res.json().catch(() => null);
   const items: any[] = Array.isArray(json?.items) ? json.items : [];
 
   for (const it of items) {
@@ -35,91 +58,36 @@ async function fetchGoogleBooksRating(title: string, author: string): Promise<nu
   return null;
 }
 
-async function getListSnapshot() {
-  const supabase = supabaseServer();
+async function openAIRecommend(seedDomains: string[], doNotRecommend: string[]) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is missing");
 
-  const { data, error } = await supabase
-    .from("books")
-    .select("title, author, domain, status, review")
-    .limit(3000);
+  const prompt = `Recommend ONE highly rated nonfiction book.
 
-  if (error) throw new Error(`Supabase read failed: ${error.message}`);
+User likes these domains:
+${seedDomains.join(", ")}
 
-  const rows = Array.isArray(data) ? data : [];
+Hard constraints:
+- Nonfiction only.
+- Do NOT recommend any title in this list (exact or near-exact match):
+${doNotRecommend.map((t) => `- ${t}`).join("\n")}
 
-  // Two sets:
-  // 1) strict: title+author key
-  // 2) loose: title-only
-  const existingStrict = new Set<string>();
-  const existingTitles = new Set<string>();
-
-  const domainCounts: Record<string, number> = {};
-  const statusCounts: Record<string, number> = {};
-  const ratedDomains: Record<string, { sum: number; n: number }> = {};
-
-  for (const r of rows) {
-    const title = clean((r as any)?.title);
-    const author = clean((r as any)?.author);
-
-    if (title) {
-      existingTitles.add(norm(title));
-      existingStrict.add(keyTitleAuthor(title, author));
-    }
-
-    const domain = clean((r as any)?.domain) || "General";
-    domainCounts[domain] = (domainCounts[domain] || 0) + 1;
-
-    const status = clean((r as any)?.status) || "Unread";
-    statusCounts[status] = (statusCounts[status] || 0) + 1;
-
-    const reviewNum = Number((r as any)?.review);
-    if (Number.isFinite(reviewNum) && reviewNum > 0) {
-      ratedDomains[domain] = ratedDomains[domain] || { sum: 0, n: 0 };
-      ratedDomains[domain].sum += reviewNum;
-      ratedDomains[domain].n += 1;
-    }
-  }
-
-  const topDomains = Object.entries(domainCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([domain, count]) => ({ domain, count }));
-
-  const avgRatingByDomain = Object.entries(ratedDomains)
-    .map(([domain, v]) => ({ domain, avg: v.sum / Math.max(1, v.n), n: v.n }))
-    .sort((a, b) => b.avg - a.avg)
-    .slice(0, 8);
-
-  return {
-    existingTitles,
-    existingStrict,
-    topDomains,
-    statusCounts,
-    avgRatingByDomain,
-    total: rows.length,
-  };
+Output JSON only with EXACT keys:
+{
+  "title": "...",
+  "author": "...",
+  "domain": "...",
+  "reason": "..."
 }
 
-type Rec = {
-  title: string;
-  author: string;
-  domain: string;
-  reason: string;
-};
+Rules:
+- domain must be exactly one of: ${ALLOWED_DOMAINS.join(", ")}
+- reason must be 1-2 sentences and specific.`;
 
-function safeParseJson(text: string): any | null {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-async function callOpenAI(openaiKey: string, prompt: string) {
-  const oaiRes = await fetch("https://api.openai.com/v1/responses", {
+  const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${openaiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -128,120 +96,154 @@ async function callOpenAI(openaiKey: string, prompt: string) {
     }),
   });
 
-  if (!oaiRes.ok) {
-    const text = await oaiRes.text();
-    throw new Error(`OpenAI error: ${text.slice(0, 200)}`);
+  const json: any = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(clean(json?.error?.message) || "OpenAI request failed");
+
+  const text = clean(json?.output_text) || clean(json?.output?.[0]?.content?.[0]?.text) || "";
+  let parsed: any;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Try to salvage embedded JSON if needed
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("OpenAI returned non-JSON.");
+    parsed = JSON.parse(m[0]);
   }
 
-  const oaiJson: any = await oaiRes.json();
-  const rawText =
-    clean(oaiJson?.output_text) ||
-    clean(oaiJson?.output?.[0]?.content?.[0]?.text) ||
-    "";
+  const title = clean(parsed?.title);
+  const author = clean(parsed?.author);
+  const domain = clean(parsed?.domain) || "General";
+  const reason = clean(parsed?.reason);
 
-  const parsed = safeParseJson(rawText);
-  if (!parsed?.title || !parsed?.author || !parsed?.domain || !parsed?.reason) {
-    throw new Error("OpenAI returned invalid JSON.");
+  if (!title || !author || !reason) throw new Error("Invalid recommendation payload from OpenAI");
+
+  return { title, author, domain, reason };
+}
+
+async function getTopDomainsFromDB() {
+  const supabase = supabaseServer();
+  const { data, error } = await supabase.from("books").select("domain").limit(300);
+  if (error) return ["Psychology", "AI", "Leadership", "History"];
+
+  const counts: Record<string, number> = {};
+  for (const r of data || []) {
+    const d = clean((r as any).domain) || "General";
+    counts[d] = (counts[d] || 0) + 1;
   }
+  const sorted = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([d]) => d);
 
-  const rec: Rec = {
-    title: clean(parsed.title),
-    author: clean(parsed.author),
-    domain: clean(parsed.domain),
-    reason: clean(parsed.reason),
-  };
+  return sorted.slice(0, 4).length ? sorted.slice(0, 4) : ["Psychology", "AI", "Leadership", "History"];
+}
 
-  return rec;
+async function fetchRecentSeenTitles(limit = 30): Promise<string[]> {
+  const supabase = supabaseServer();
+  const { data, error } = await supabase
+    .from("recommendation_history")
+    .select("title")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) return [];
+  return (data || []).map((r: any) => clean(r.title)).filter(Boolean);
+}
+
+async function existsInBooks(title: string): Promise<boolean> {
+  const supabase = supabaseServer();
+  const { data, error } = await supabase
+    .from("books")
+    .select("id, title")
+    .ilike("title", title)
+    .limit(25);
+
+  if (error) return false;
+  const target = norm(title);
+  return (data || []).some((r: any) => norm(r.title) === target);
+}
+
+async function existsInSeen(title: string): Promise<boolean> {
+  const supabase = supabaseServer();
+  const { data, error } = await supabase
+    .from("recommendation_history")
+    .select("id, title")
+    .ilike("title", title)
+    .limit(25);
+
+  if (error) return false;
+  const target = norm(title);
+  return (data || []).some((r: any) => norm(r.title) === target);
+}
+
+async function saveSeen(title: string) {
+  const supabase = supabaseServer();
+  await supabase.from("recommendation_history").insert([{ title }]);
+}
+
+async function cleanupSeen(keepLast = 500) {
+  // Optional. keep the table small-ish.
+  const supabase = supabaseServer();
+
+  const { data } = await supabase
+    .from("recommendation_history")
+    .select("id")
+    .order("created_at", { ascending: false })
+    .range(keepLast, keepLast + 1000);
+
+  const ids = (data || []).map((r: any) => r.id).filter(Boolean);
+  if (ids.length) {
+    await supabase.from("recommendation_history").delete().in("id", ids);
+  }
 }
 
 export async function GET() {
   try {
-    const openaiKey = process.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      return NextResponse.json({ error: "Missing OPENAI_API_KEY." }, { status: 500 });
-    }
+    const seedDomains = await getTopDomainsFromDB();
 
-    const snap = await getListSnapshot();
+    const recentSeen = await fetchRecentSeenTitles(30);
 
-    // Try multiple times before giving up.
-    const MAX_ATTEMPTS = 6;
-    let lastErr: string | null = null;
+    // Also exclude the last shown title explicitly
+    const doNotRecommend = recentSeen.slice(0, 30);
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const nonce = `${Date.now()}-${attempt}`;
+    const MAX_TRIES = 8;
 
-      const prompt = `You are a book recommender for a nonfiction reader.
+    for (let i = 0; i < MAX_TRIES; i++) {
+      const base = await openAIRecommend(seedDomains, doNotRecommend);
 
-Reader profile signals (from their personal database):
-- Total books in list: ${snap.total}
-- Status counts: ${JSON.stringify(snap.statusCounts)}
-- Top domains by volume: ${JSON.stringify(snap.topDomains)}
-- Domains with highest average ratings (from their list): ${JSON.stringify(snap.avgRatingByDomain)}
+      // Hard checks. Not in your list. Not in recently seen.
+      const dupeInBooks = await existsInBooks(base.title);
+      if (dupeInBooks) continue;
 
-Hard requirements:
-- Recommend ONE nonfiction book that is NOT already in the user's list.
-- Ensure intellectual breadth: pick something adjacent but not redundant with their most dominant domain.
-- Do NOT recommend catalogs, library-admin manuals, or writing-market directories. Recommend real reader-facing nonfiction.
+      const dupeInSeen = await existsInSeen(base.title);
+      if (dupeInSeen) continue;
 
-Existing titles and strict keys:
-- Title-only set size: ${snap.existingTitles.size}
-- Strict (title+author) set size: ${snap.existingStrict.size}
+      const rating = await fetchGoogleBooksRating(base.title, base.author);
 
-Uniqueness rules you must follow:
-- The recommended title must NOT match any existing title in the user's list.
-- Also avoid close repeats of extremely famous books likely already present.
+      const rec: Rec = {
+        title: base.title,
+        author: base.author,
+        domain: base.domain,
+        rating: typeof rating === "number" ? rating : null,
+        reason: base.reason,
+      };
 
-Non-repeat nonce (avoid repeating your last output): ${nonce}
+      await saveSeen(rec.title);
+      cleanupSeen(500).catch(() => {});
 
-Output format:
-Return ONLY valid JSON with exactly these keys:
-{
-  "title": "...",
-  "author": "...",
-  "domain": "...",
-  "reason": "..."
-}
-
-Reason rules:
-- 2 to 4 sentences max.
-- Tie directly to the user’s domain mix and desire for variety.
-- No generic fluff.`;
-
-      try {
-        const rec = await callOpenAI(openaiKey, prompt);
-
-        const strictKey = keyTitleAuthor(rec.title, rec.author);
-        const titleKey = norm(rec.title);
-
-        // Hard guard: reject if title matches anything in list.
-        if (snap.existingTitles.has(titleKey) || snap.existingStrict.has(strictKey)) {
-          lastErr = "Recommendation matched an existing title.";
-          continue;
-        }
-
-        const rating = await fetchGoogleBooksRating(rec.title, rec.author);
-
-        return NextResponse.json({
-          ok: true,
-          recommendation: {
-            ...rec,
-            rating: rating ?? null,
-          },
-        });
-      } catch (e: any) {
-        lastErr = e?.message || "Unknown error during recommendation.";
-        continue;
-      }
+      return NextResponse.json(
+        { ok: true, recommendation: rec, tries: i + 1 },
+        { headers: { "Cache-Control": "no-store, max-age=0" } }
+      );
     }
 
     return NextResponse.json(
-      { error: `${lastErr || "Could not find a unique recommendation."} Try refresh.` },
-      { status: 500 }
+      { error: "Could not find a fresh recommendation after several tries. Try again." },
+      { status: 409, headers: { "Cache-Control": "no-store, max-age=0" } }
     );
   } catch (e: any) {
     return NextResponse.json(
-      { error: e?.message || "Unknown server error." },
-      { status: 500 }
+      { error: e?.message || "Unknown server error" },
+      { status: 500, headers: { "Cache-Control": "no-store, max-age=0" } }
     );
   }
 }
